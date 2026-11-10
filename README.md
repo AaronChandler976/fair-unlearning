@@ -1,4 +1,4 @@
-# Fair Machine Unlearning: Data Removal While Mitigating Disparities
+# Efficient and Fair Machine Unlearning: Newton-Based Data Removal, Demographic Fairness, and Multi-Dataset Evaluation.
 
 An implementation and experimental study of **Fair Machine Unlearning**, based on the paper *Fair Machine Unlearning: Data Removal while Mitigating Disparities* (AISTATS 2024).
 
