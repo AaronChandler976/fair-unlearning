@@ -459,7 +459,7 @@ National Center for Education Statistics (NCES). *High School Longitudinal Study
 
 ---
 
-**Author:** Ahmed Sabzwari
+**Author:** Ahmed Sabzwari, Omar Jamjoum, Aaron Chandler
 
 **Research Focus:** Machine Learning Systems · Algorithmic Fairness · Optimization · Responsible AI
 
