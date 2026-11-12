@@ -15,7 +15,12 @@ Deletion settings follow the paper (Section 5.2):
     minority : 1, 5, 10 %       of the training set, all from the smaller group
 
 Percentages are of the WHOLE training set, not of the group.
-Each seed draws a different random deletion set (paper: 5 repeats, mean +/- std).
+Each seed draws a different random deletion set (paper: 5 repeats, mean +/- std)
+on one fixed train/test split. --vary-split also draws a new split (and new
+original models) per seed, to measure split-to-split variation.
+
+Data preprocessing matches the paper's official code (src/data/datasets.py):
+race as the sensitive attribute, rows scaled to ||x|| <= 1, intercept column.
 
 Not included: the objective-perturbation noise (b^T theta) used for the
 (epsilon, delta) certificate. This script measures how close Newton gets to
@@ -26,8 +31,9 @@ Usage (from the repo root):
     python -m experiments.run_deletion_sweep --datasets compas adult --seeds 5
     python -m experiments.run_deletion_sweep --quick          # 1 seed, smoke test
     python -m experiments.run_deletion_sweep --plot-only      # redo summary + plots
+    python -m experiments.run_deletion_sweep --vary-split     # new split per seed
 
-Outputs (experiments/results/):
+Outputs (experiments/results/, or experiments/results/vary_split/):
     deletion_sweep_raw_<dataset>.csv   every seed, every method
     deletion_sweep_summary.csv         mean +/- std over seeds, all datasets
     plots/deletion_sweep/<dataset>_<deletion>_<aeod|accuracy>.png
@@ -57,12 +63,19 @@ DELETION_RATES = {
     "minority": [0.01, 0.05, 0.10],
 }
 
-DAMPING = 1e-4
+# No Hessian damping, as in the paper: the L2 term already makes the Hessian
+# invertible, and with lambda = 1e-4 even a 1e-4 damping would bend the step.
+DAMPING = 0.0
 MAX_ITER = 500
-RESULTS_DIR = Path("experiments/results")
+BASE_RESULTS_DIR = Path("experiments/results")
 RAW_CSV_PATTERN = "deletion_sweep_raw_{}.csv"  # one file per dataset
-SUMMARY_CSV = RESULTS_DIR / "deletion_sweep_summary.csv"
-PLOT_DIR = RESULTS_DIR / "plots" / "deletion_sweep"
+SUMMARY_NAME = "deletion_sweep_summary.csv"
+PLOT_SUBDIR = Path("plots") / "deletion_sweep"
+
+
+def results_dir(vary_split=False):
+    """Paper protocol -> experiments/results/; --vary-split -> .../vary_split/."""
+    return BASE_RESULTS_DIR / "vary_split" if vary_split else BASE_RESULTS_DIR
 
 METHODS = [
     # (method name, loss type, kind)
@@ -77,18 +90,10 @@ METHODS = [
 # Data
 # ----------------------------------------------------------------------
 
-def load_dataset(name):
-    """Import lazily so a missing HSLS csv doesn't block Adult/COMPAS."""
-    if name == "adult":
-        from src.data.adult import load_adult
-        return load_adult()
-    if name == "compas":
-        from src.data.compas import load_compas
-        return load_compas()
-    if name == "hsls":
-        from src.data.hsls import load_hsls
-        return load_hsls()
-    raise ValueError(f"Unknown dataset: {name}")
+def load_dataset(name, split_seed=0):
+    """Paper-preprocessed train/test split (see src/data/datasets.py)."""
+    from src.data.datasets import load_dataset as load
+    return load(name, random_state=split_seed)
 
 
 # ----------------------------------------------------------------------
@@ -146,7 +151,7 @@ def choose_deletions(deletion_type, rate, sensitive_train, roles, seed):
     Returns None if the request would empty a group (the fair loss needs both).
     """
     n = len(sensitive_train)
-    num_delete = int(rate * n)
+    num_delete = int(round(rate * n))  # paper code: np.round(n / 100 * pct)
     generator = torch.Generator().manual_seed(seed)
 
     if deletion_type == "random":
@@ -223,17 +228,51 @@ def run_scenario(data, originals, deleted, hp):
 # Main sweep
 # ----------------------------------------------------------------------
 
-def sweep(datasets, num_seeds, gamma_override, lambda_override):
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+def prepare_split(name, hp, split_seed):
+    """Load one train/test split and train the two full-data models on it."""
+    data = load_dataset(name, split_seed)
+    s_train = data["sensitive_train"]
+    roles = group_roles(s_train)
+    print(
+        f"Split {split_seed} | train size {len(s_train)} | "
+        f"minority = group {roles['minority']} "
+        f"({(s_train == roles['minority']).sum().item()} rows) | "
+        f"gamma = {hp['gamma']}, lambda = {hp['lambda_reg']}"
+    )
+
+    # Original models on the full training set, one per loss type.
+    originals, reference = {}, {}
+    for loss_type in ("fair", "bce"):
+        gamma = hp["gamma"] if loss_type == "fair" else 0.0
+        originals[loss_type] = train_model(
+            data["X_train"], data["y_train"], s_train,
+            lambda_reg=hp["lambda_reg"], gamma=gamma, max_iter=MAX_ITER,
+        )
+        reference[loss_type] = calculate_metrics(
+            originals[loss_type],
+            data["X_test"], data["y_test"], data["sensitive_test"],
+        )
+        print(
+            f"  Full Training ({loss_type.upper()}): "
+            f"acc {reference[loss_type][0]:.4f}, "
+            f"AEOD {reference[loss_type][1]:.4f}"
+        )
+    return data, roles, originals, reference
+
+
+def sweep(datasets, num_seeds, gamma_override, lambda_override,
+          vary_split=False):
+    """
+    Paper protocol (vary_split=False): one train/test split and one pair of
+    original models; each seed re-draws only the deleted rows.
+    vary_split=True: each seed also gets a new split and new original models.
+    """
+    out_dir = results_dir(vary_split)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     for name in datasets:
         all_rows = []
         print(f"\n{'=' * 60}\nDataset: {name}\n{'=' * 60}")
-        try:
-            data = load_dataset(name)
-        except FileNotFoundError as error:
-            print(f"Skipping {name}: {error}")
-            continue
 
         hp = dict(PAPER_HYPERPARAMS[name])
         if gamma_override is not None:
@@ -241,39 +280,17 @@ def sweep(datasets, num_seeds, gamma_override, lambda_override):
         if lambda_override is not None:
             hp["lambda_reg"] = lambda_override
 
-        s_train = data["sensitive_train"]
-        roles = group_roles(s_train)
-        print(
-            f"Train size {len(s_train)} | "
-            f"minority = group {roles['minority']} "
-            f"({(s_train == roles['minority']).sum().item()} rows) | "
-            f"gamma = {hp['gamma']}, lambda = {hp['lambda_reg']}"
-        )
-
-        # Original models on the full training set, one per loss type.
-        originals = {}
-        reference = {}
-        for loss_type in ("fair", "bce"):
-            gamma = hp["gamma"] if loss_type == "fair" else 0.0
-            originals[loss_type] = train_model(
-                data["X_train"], data["y_train"], s_train,
-                lambda_reg=hp["lambda_reg"], gamma=gamma, max_iter=MAX_ITER,
-            )
-            reference[loss_type] = calculate_metrics(
-                originals[loss_type],
-                data["X_test"], data["y_test"], data["sensitive_test"],
-            )
-            print(
-                f"Full Training ({loss_type.upper()}): "
-                f"acc {reference[loss_type][0]:.4f}, "
-                f"AEOD {reference[loss_type][1]:.4f}"
-            )
+        split_seeds = list(range(num_seeds)) if vary_split else [0]
+        splits = {seed: prepare_split(name, hp, seed) for seed in split_seeds}
 
         for deletion_type, rates in DELETION_RATES.items():
             for rate in rates:
                 for seed in range(num_seeds):
+                    split_seed = seed if vary_split else 0
+                    data, roles, originals, reference = splits[split_seed]
                     deleted = choose_deletions(
-                        deletion_type, rate, s_train, roles, seed
+                        deletion_type, rate, data["sensitive_train"], roles,
+                        seed,
                     )
                     if deleted is None:
                         print(
@@ -289,6 +306,7 @@ def sweep(datasets, num_seeds, gamma_override, lambda_override):
                             "deletion_type": deletion_type,
                             "deletion_rate": rate,
                             "seed": seed,
+                            "split_seed": split_seed,
                             "num_deleted": len(deleted),
                             "gamma": hp["gamma"],
                             "lambda_reg": hp["lambda_reg"],
@@ -308,21 +326,22 @@ def sweep(datasets, num_seeds, gamma_override, lambda_override):
                     )
 
         # One raw file per dataset, so datasets can be run separately.
-        raw_path = RESULTS_DIR / RAW_CSV_PATTERN.format(name)
+        raw_path = out_dir / RAW_CSV_PATTERN.format(name)
         write_csv(raw_path, all_rows)
         print(f"Raw results: {raw_path}")
 
-    return build_summary()
+    return build_summary(out_dir)
 
 
-def build_summary():
+def build_summary(out_dir):
     """Combine every per-dataset raw file into one summary CSV."""
     rows = []
-    for path in sorted(RESULTS_DIR.glob(RAW_CSV_PATTERN.format("*"))):
+    for path in sorted(out_dir.glob(RAW_CSV_PATTERN.format("*"))):
         rows.extend(read_csv(path))
     summary = summarize(rows)
-    write_csv(SUMMARY_CSV, summary)
-    print(f"Summary results: {SUMMARY_CSV}")
+    summary_path = out_dir / SUMMARY_NAME
+    write_csv(summary_path, summary)
+    print(f"Summary results: {summary_path}")
     return summary
 
 
@@ -373,13 +392,14 @@ def summarize(rows):
     return summary
 
 
-def plot(summary):
+def plot(summary, out_dir):
     """One AEOD plot and one accuracy plot per (dataset, deletion type)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    plot_dir = out_dir / PLOT_SUBDIR
+    plot_dir.mkdir(parents=True, exist_ok=True)
     styles = {
         "Fair Unlearning": dict(color="tab:green", linestyle="-", marker="o"),
         "Retraining (Fair)": dict(color="black", linestyle="-", marker="x"),
@@ -415,10 +435,10 @@ def plot(summary):
             ax.grid(alpha=0.3)
             ax.legend(fontsize=7)
             fig.tight_layout()
-            out = PLOT_DIR / f"{dataset}_{deletion_type}_{metric}.png"
+            out = plot_dir / f"{dataset}_{deletion_type}_{metric}.png"
             fig.savefig(out, dpi=150)
             plt.close(fig)
-    print(f"Plots: {PLOT_DIR}")
+    print(f"Plots: {plot_dir}")
 
 
 # ----------------------------------------------------------------------
@@ -438,15 +458,20 @@ def main():
                         help="1 seed, for a fast smoke test.")
     parser.add_argument("--plot-only", action="store_true",
                         help="Re-plot from the existing summary CSV.")
+    parser.add_argument("--vary-split", action="store_true",
+                        help="New train/test split (and new original models) "
+                             "for every seed. The paper keeps one split.")
     args = parser.parse_args()
+    out_dir = results_dir(args.vary_split)
 
     if args.plot_only:
-        plot(build_summary())
+        plot(build_summary(out_dir), out_dir)
         return
 
     seeds = 1 if args.quick else args.seeds
-    summary = sweep(args.datasets, seeds, args.gamma, args.lambda_reg)
-    plot(summary)
+    summary = sweep(args.datasets, seeds, args.gamma, args.lambda_reg,
+                    args.vary_split)
+    plot(summary, out_dir)
 
 
 if __name__ == "__main__":
