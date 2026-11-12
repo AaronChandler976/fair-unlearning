@@ -223,17 +223,15 @@ so only the speedups are comparable.
 - Large ε values at high deletion rates mean the certificate is weak there;
   the paper's bound scales with the number of deleted rows.
 
-## Earlier experiment scripts
+## Other scripts in `tests/`
 
-`experiments/run_{adult,compas,hsls}_{deletion_rates,group_deletion}.py`,
-`build_summary.py`, `plot_results.py`, `plot_group_results.py` and the scripts in
-`tests/test_*.py` (other than `test_reproduction.py`) come from the project's
-first iteration. They now use the paper's preprocessing through
-`load_adult()` / `load_compas()` / `load_hsls()`. The `run_*` scripts need the
-model files written by `python -m tests.test_{adult,compas,hsls}_training`.
-Their saved results in `experiments/results/*.csv` and
-`experiments/results/plots/*.png` predate the paper setup;
-`run_deletion_sweep.py` supersedes them.
+Besides the pytest suite (`tests/test_reproduction.py`), `tests/` holds
+standalone checks from the project's first iteration, run with
+`python -m tests.<name>` (for example `python -m tests.test_fair_loss`).
+`test_adult_unlearning` needs the model file written by
+`python -m tests.test_adult_training`. Earlier experiment scripts and their
+results, which used a pre-paper data setup, were replaced by
+`experiments/run_deletion_sweep.py` and remain in the git history.
 
 ## References
 
