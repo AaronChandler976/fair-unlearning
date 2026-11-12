@@ -10,3 +10,6 @@ __pycache__/
 # Virtual environments
 venv/
 .venv/
+
+# Official code clone used by validation/compare_official.py
+external/
