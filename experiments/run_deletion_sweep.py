@@ -1,30 +1,36 @@
 """
-Task 2: Newton unlearning vs. full retraining, matching the paper's setup.
+Deletion sweep: reproduces the paper's Figures 1, 3, 5-7 and Tables 4-6.
 
-For every (dataset, deletion type, deletion rate, seed), this script runs
-four methods, the same four lines as the paper's Figures 1 and 3:
+For every (dataset, deletion type, deletion rate, seed), this script evaluates
+the same methods as the paper (Section 5.1):
 
-    Fair Unlearning   = Newton step on the fair loss (gamma > 0)
-    Retraining (Fair) = retrain from scratch on the fair loss
-    Newton (BCE)      = Newton step on plain BCE (gamma = 0), Guo et al. 2020
-    Retraining (BCE)  = retrain from scratch on plain BCE
+    Fair loss (solid lines in the paper)
+        Full Training (Fair)  original fair model, nothing removed (reference)
+        Fair Unlearning       the paper's method: Newton step on the fair loss
+        Retraining (Fair)     retrain from scratch on the fair loss
+    BCE loss (dashed lines in the paper)
+        Full Training (BCE)   original BCE model, nothing removed (reference)
+        Newton (BCE)          Guo et al. (2020): Newton step on BCE
+        SISA (BCE)            Bourtoule et al. (2020): 5 shards, majority vote
+        PRU (BCE)             Izzo et al. (2021): projective residual update
+        Retraining (BCE)      retrain from scratch on BCE
 
-Deletion settings follow the paper (Section 5.2):
-    random   : 1, 5, 10, 15, 20 % of the training set, from anyone
-    majority : 1, 5, 10, 15, 20 % of the training set, all from the larger group
-    minority : 1, 5, 10 %       of the training set, all from the smaller group
+Deletion settings follow the paper (Section 5.2), as % of the WHOLE training set:
+    random   : 1, 5, 10, 15, 20 %, from anyone
+    majority : 1, 5, 10, 15, 20 %, all from the larger race group
+    minority : 1, 5, 10 %,         all from the smaller race group
 
-Percentages are of the WHOLE training set, not of the group.
-Each seed draws a different random deletion set (paper: 5 repeats, mean +/- std)
-on one fixed train/test split. --vary-split also draws a new split (and new
-original models) per seed, to measure split-to-split variation.
+Noise: training and retraining minimize L + b^T theta with b ~ N(0, sigma^2 I),
+sigma = 1 as in the paper (App. A.6). The same b is used for a split's original
+models and every retraining on it. SISA shards are trained without noise, as
+in the official code. For Fair Unlearning and Newton (BCE) each request also
+gets its (epsilon, delta) certificate at delta = 1e-4 (src/unlearning/certificate.py).
 
-Data preprocessing matches the paper's official code (src/data/datasets.py):
-race as the sensitive attribute, rows scaled to ||x|| <= 1, intercept column.
+Repeats: each seed re-draws the deleted rows on one fixed train/test split
+(paper: 5 repeats, mean +/- std). --vary-split also draws a new split, noise
+vector and original models per seed, to measure split-to-split variation.
 
-Not included: the objective-perturbation noise (b^T theta) used for the
-(epsilon, delta) certificate. This script measures how close Newton gets to
-retraining, which is what the paper's accuracy/AEOD figures report.
+Data preprocessing matches the paper's official code (src/data/datasets.py).
 
 Usage (from the repo root):
     python -m experiments.run_deletion_sweep
@@ -32,21 +38,32 @@ Usage (from the repo root):
     python -m experiments.run_deletion_sweep --quick          # 1 seed, smoke test
     python -m experiments.run_deletion_sweep --plot-only      # redo summary + plots
     python -m experiments.run_deletion_sweep --vary-split     # new split per seed
+    python -m experiments.run_deletion_sweep --sigma 0        # no noise
 
 Outputs (experiments/results/, or experiments/results/vary_split/):
     deletion_sweep_raw_<dataset>.csv   every seed, every method
     deletion_sweep_summary.csv         mean +/- std over seeds, all datasets
-    plots/deletion_sweep/<dataset>_<deletion>_<aeod|accuracy>.png
+    plots/deletion_sweep/<dataset>_<deletion>_<metric>.png
+        metric: aeod, accuracy, dp, eopp, subgroup_acc
 """
 
 import argparse
 import csv
+import math
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
+from src.data.datasets import load_dataset
+from src.evaluation.metrics import calculate_metrics, compute_metrics
 from src.objectives.train import train_model
+from src.unlearning.baselines import (
+    pru_precompute, pru_unlearn, sisa_predict, sisa_shards, sisa_train,
+    sisa_unlearn,
+)
+from src.unlearning.certificate import certificate
 from src.unlearning.newton import newton_unlearn
 
 
@@ -63,10 +80,29 @@ DELETION_RATES = {
     "minority": [0.01, 0.05, 0.10],
 }
 
-# No Hessian damping, as in the paper: the L2 term already makes the Hessian
-# invertible, and with lambda = 1e-4 even a 1e-4 damping would bend the step.
-DAMPING = 0.0
+SIGMA = 1.0      # objective-perturbation noise (paper App. A.6)
+DELTA = 1e-4     # certificate failure probability (paper App. A.6)
 MAX_ITER = 500
+NOISE_SEED_OFFSET = 10_000   # keeps noise draws independent of deletion draws
+
+METHODS = [
+    # (name, loss type, kind)
+    ("Full Training (Fair)", "fair", "full"),
+    ("Fair Unlearning", "fair", "newton"),
+    ("Retraining (Fair)", "fair", "retrain"),
+    ("Full Training (BCE)", "bce", "full"),
+    ("Newton (BCE)", "bce", "newton"),
+    ("SISA (BCE)", "bce", "sisa"),
+    ("PRU (BCE)", "bce", "pru"),
+    ("Retraining (BCE)", "bce", "retrain"),
+]
+RETRAIN_METHOD = {"fair": "Retraining (Fair)", "bce": "Retraining (BCE)"}
+METRICS = ["accuracy", "aeod", "dp", "eopp", "subgroup_acc"]
+SUMMARY_FIELDS = METRICS + [
+    "param_distance", "runtime_s", "epsilon", "epsilon_official_code",
+    "eps_prime_data", "eps_prime_theorem",
+]
+
 BASE_RESULTS_DIR = Path("experiments/results")
 RAW_CSV_PATTERN = "deletion_sweep_raw_{}.csv"  # one file per dataset
 SUMMARY_NAME = "deletion_sweep_summary.csv"
@@ -76,60 +112,6 @@ PLOT_SUBDIR = Path("plots") / "deletion_sweep"
 def results_dir(vary_split=False):
     """Paper protocol -> experiments/results/; --vary-split -> .../vary_split/."""
     return BASE_RESULTS_DIR / "vary_split" if vary_split else BASE_RESULTS_DIR
-
-METHODS = [
-    # (method name, loss type, kind)
-    ("Fair Unlearning", "fair", "newton"),
-    ("Retraining (Fair)", "fair", "retrain"),
-    ("Newton (BCE)", "bce", "newton"),
-    ("Retraining (BCE)", "bce", "retrain"),
-]
-
-
-# ----------------------------------------------------------------------
-# Data
-# ----------------------------------------------------------------------
-
-def load_dataset(name, split_seed=0):
-    """Paper-preprocessed train/test split (see src/data/datasets.py)."""
-    from src.data.datasets import load_dataset as load
-    return load(name, random_state=split_seed)
-
-
-# ----------------------------------------------------------------------
-# Metrics
-# ----------------------------------------------------------------------
-
-def calculate_metrics(theta, X, y, sensitive):
-    """Test accuracy and AEOD = 0.5 * (|TPR_a - TPR_b| + |FPR_a - FPR_b|)."""
-    with torch.no_grad():
-        predictions = (X @ theta >= 0).long()  # same as sigmoid >= 0.5
-        labels = y.long()
-
-        accuracy = (predictions == labels).double().mean().item()
-
-        rates = {}
-        for group in (0, 1):
-            mask = sensitive == group
-            pred = predictions[mask]
-            actual = labels[mask]
-
-            tp = ((pred == 1) & (actual == 1)).sum().item()
-            fn = ((pred == 0) & (actual == 1)).sum().item()
-            fp = ((pred == 1) & (actual == 0)).sum().item()
-            tn = ((pred == 0) & (actual == 0)).sum().item()
-
-            rates[group] = {
-                "TPR": tp / max(tp + fn, 1),
-                "FPR": fp / max(fp + tn, 1),
-            }
-
-        aeod = 0.5 * (
-            abs(rates[0]["TPR"] - rates[1]["TPR"])
-            + abs(rates[0]["FPR"] - rates[1]["FPR"])
-        )
-
-    return accuracy, aeod
 
 
 # ----------------------------------------------------------------------
@@ -168,59 +150,126 @@ def choose_deletions(deletion_type, rate, sensitive_train, roles, seed):
 
 
 # ----------------------------------------------------------------------
-# One scenario: 4 methods on one deletion set
+# One train/test split: data, noise, original models, baseline setup
 # ----------------------------------------------------------------------
 
-def run_scenario(data, originals, deleted, hp):
-    X_train, y_train, s_train = (
-        data["X_train"], data["y_train"], data["sensitive_train"]
-    )
-    X_test, y_test, s_test = (
-        data["X_test"], data["y_test"], data["sensitive_test"]
+def prepare_split(name, hp, split_seed, sigma):
+    data = load_dataset(name, random_state=split_seed)
+    X, y, s = data["X_train"], data["y_train"], data["sensitive_train"]
+    roles = group_roles(s)
+    print(
+        f"Split {split_seed} | train size {len(s)} | "
+        f"minority = group {roles['minority']} "
+        f"({(s == roles['minority']).sum().item()} rows) | "
+        f"gamma = {hp['gamma']}, lambda = {hp['lambda_reg']}, sigma = {sigma}"
     )
 
-    keep = torch.ones(len(X_train), dtype=torch.bool)
+    generator = torch.Generator().manual_seed(NOISE_SEED_OFFSET + split_seed)
+    noise = (
+        sigma * torch.randn(X.shape[1], generator=generator, dtype=torch.float64)
+        if sigma > 0 else None
+    )
+
+    originals = {}
+    for loss_type in ("fair", "bce"):
+        gamma = hp["gamma"] if loss_type == "fair" else 0.0
+        originals[loss_type] = train_model(
+            X, y, s, lambda_reg=hp["lambda_reg"], gamma=gamma,
+            max_iter=MAX_ITER, noise=noise,
+        )
+        m = calculate_metrics(originals[loss_type], data["X_test"],
+                              data["y_test"], data["sensitive_test"])
+        print(f"  Full Training ({loss_type.upper()}): "
+              f"acc {m['accuracy']:.4f}, AEOD {m['aeod']:.4f}")
+
+    start = time.perf_counter()
+    shards = sisa_shards(len(X))
+    shard_thetas = sisa_train(X, y, s, shards, hp["lambda_reg"], MAX_ITER)
+    sisa_time = time.perf_counter() - start
+
+    start = time.perf_counter()
+    pru_pre = pru_precompute(X.numpy(), y.numpy(), originals["bce"].numpy(),
+                             hp["lambda_reg"])
+    pru_time = time.perf_counter() - start
+    print(f"  Precompute: SISA shards {sisa_time:.2f}s, PRU {pru_time:.2f}s")
+
+    return {
+        "data": data, "roles": roles, "noise": noise, "originals": originals,
+        "shards": shards, "shard_thetas": shard_thetas, "pru": pru_pre,
+    }
+
+
+# ----------------------------------------------------------------------
+# One scenario: every method on one deletion set
+# ----------------------------------------------------------------------
+
+def run_scenario(split, deleted, hp, sigma):
+    data, noise, originals = split["data"], split["noise"], split["originals"]
+    X, y, s = data["X_train"], data["y_train"], data["sensitive_train"]
+    X_test, y_test, s_test = data["X_test"], data["y_test"], data["sensitive_test"]
+
+    keep = torch.ones(len(X), dtype=torch.bool)
     keep[deleted] = False
-    X_rem, y_rem, s_rem = X_train[keep], y_train[keep], s_train[keep]
+    X_rem, y_rem, s_rem = X[keep], y[keep], s[keep]
 
-    rows = []
-    thetas = {}
-
+    rows, thetas = [], {}
     for method, loss_type, kind in METHODS:
         gamma = hp["gamma"] if loss_type == "fair" else 0.0
+        theta, predictions, runtime = None, None, float("nan")
         start = time.perf_counter()
 
-        if kind == "newton":
+        if kind == "full":
+            theta = originals[loss_type]
+        elif kind == "newton":
             theta, _ = newton_unlearn(
                 originals[loss_type], X_rem, y_rem, s_rem,
-                lambda_reg=hp["lambda_reg"], gamma=gamma, damping=DAMPING,
+                lambda_reg=hp["lambda_reg"], gamma=gamma, noise=noise,
             )
-        else:
+            runtime = time.perf_counter() - start
+        elif kind == "retrain":
             theta = train_model(
-                X_rem, y_rem, s_rem,
-                lambda_reg=hp["lambda_reg"], gamma=gamma, max_iter=MAX_ITER,
+                X_rem, y_rem, s_rem, lambda_reg=hp["lambda_reg"],
+                gamma=gamma, max_iter=MAX_ITER, noise=noise,
             )
+            runtime = time.perf_counter() - start
+        elif kind == "sisa":
+            new_thetas = sisa_unlearn(
+                X, y, s, split["shards"], split["shard_thetas"],
+                deleted.numpy(), hp["lambda_reg"], MAX_ITER,
+            )
+            runtime = time.perf_counter() - start
+            predictions = sisa_predict(new_thetas, X_test)
+        elif kind == "pru":
+            theta = pru_unlearn(split["pru"], deleted.numpy())
+            runtime = time.perf_counter() - start
 
-        runtime = time.perf_counter() - start
-        thetas[(loss_type, kind)] = theta
-        accuracy, aeod = calculate_metrics(theta, X_test, y_test, s_test)
+        if predictions is None:
+            predictions = (X_test @ theta >= 0).long()
+        row = {"method": method, "loss_type": loss_type, "kind": kind,
+               "runtime_s": runtime}
+        row.update(compute_metrics(predictions, y_test, s_test))
+        rows.append(row)
+        thetas[method] = theta
 
-        rows.append({
-            "method": method,
-            "loss_type": loss_type,
-            "kind": kind,
-            "accuracy": accuracy,
-            "aeod": aeod,
-            "runtime_s": runtime,
-        })
-
-    # How far each Newton jump lands from its own retrained optimum.
+    # Distance to the retrained model of the same loss; certificate for the
+    # two Newton-type methods.
     for row in rows:
-        lt = row["loss_type"]
-        row["param_distance"] = torch.norm(
-            thetas[(lt, "newton")] - thetas[(lt, "retrain")]
-        ).item()
-
+        theta = thetas[row["method"]]
+        target = thetas[RETRAIN_METHOD[row["loss_type"]]]
+        row["param_distance"] = (
+            torch.norm(theta - target).item() if theta is not None
+            else float("nan")
+        )
+        cert = {}
+        if row["kind"] == "newton":
+            cert = certificate(
+                X_rem, s, deleted, originals[row["loss_type"]], theta,
+                hp["lambda_reg"], sigma, DELTA,
+                fair=row["loss_type"] == "fair",
+            )
+        for key in ("epsilon", "epsilon_official_code", "eps_prime_data",
+                    "eps_prime_theorem"):
+            row[key] = cert.get(key, float("nan"))
     return rows
 
 
@@ -228,45 +277,8 @@ def run_scenario(data, originals, deleted, hp):
 # Main sweep
 # ----------------------------------------------------------------------
 
-def prepare_split(name, hp, split_seed):
-    """Load one train/test split and train the two full-data models on it."""
-    data = load_dataset(name, split_seed)
-    s_train = data["sensitive_train"]
-    roles = group_roles(s_train)
-    print(
-        f"Split {split_seed} | train size {len(s_train)} | "
-        f"minority = group {roles['minority']} "
-        f"({(s_train == roles['minority']).sum().item()} rows) | "
-        f"gamma = {hp['gamma']}, lambda = {hp['lambda_reg']}"
-    )
-
-    # Original models on the full training set, one per loss type.
-    originals, reference = {}, {}
-    for loss_type in ("fair", "bce"):
-        gamma = hp["gamma"] if loss_type == "fair" else 0.0
-        originals[loss_type] = train_model(
-            data["X_train"], data["y_train"], s_train,
-            lambda_reg=hp["lambda_reg"], gamma=gamma, max_iter=MAX_ITER,
-        )
-        reference[loss_type] = calculate_metrics(
-            originals[loss_type],
-            data["X_test"], data["y_test"], data["sensitive_test"],
-        )
-        print(
-            f"  Full Training ({loss_type.upper()}): "
-            f"acc {reference[loss_type][0]:.4f}, "
-            f"AEOD {reference[loss_type][1]:.4f}"
-        )
-    return data, roles, originals, reference
-
-
 def sweep(datasets, num_seeds, gamma_override, lambda_override,
-          vary_split=False):
-    """
-    Paper protocol (vary_split=False): one train/test split and one pair of
-    original models; each seed re-draws only the deleted rows.
-    vary_split=True: each seed also gets a new split and new original models.
-    """
+          vary_split=False, sigma=SIGMA):
     out_dir = results_dir(vary_split)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -281,25 +293,24 @@ def sweep(datasets, num_seeds, gamma_override, lambda_override,
             hp["lambda_reg"] = lambda_override
 
         split_seeds = list(range(num_seeds)) if vary_split else [0]
-        splits = {seed: prepare_split(name, hp, seed) for seed in split_seeds}
+        splits = {seed: prepare_split(name, hp, seed, sigma)
+                  for seed in split_seeds}
 
         for deletion_type, rates in DELETION_RATES.items():
             for rate in rates:
                 for seed in range(num_seeds):
                     split_seed = seed if vary_split else 0
-                    data, roles, originals, reference = splits[split_seed]
+                    split = splits[split_seed]
                     deleted = choose_deletions(
-                        deletion_type, rate, data["sensitive_train"], roles,
-                        seed,
+                        deletion_type, rate, split["data"]["sensitive_train"],
+                        split["roles"], seed,
                     )
                     if deleted is None:
-                        print(
-                            f"  skip {deletion_type} {rate:.0%}: "
-                            f"would empty the group"
-                        )
+                        print(f"  skip {deletion_type} {rate:.0%}: "
+                              f"would empty the group")
                         break
 
-                    rows = run_scenario(data, originals, deleted, hp)
+                    rows = run_scenario(split, deleted, hp, sigma)
                     for row in rows:
                         row.update({
                             "dataset": name,
@@ -310,22 +321,22 @@ def sweep(datasets, num_seeds, gamma_override, lambda_override,
                             "num_deleted": len(deleted),
                             "gamma": hp["gamma"],
                             "lambda_reg": hp["lambda_reg"],
-                            "full_fair_accuracy": reference["fair"][0],
-                            "full_fair_aeod": reference["fair"][1],
-                            "full_bce_accuracy": reference["bce"][0],
-                            "full_bce_aeod": reference["bce"][1],
+                            "sigma": sigma,
                         })
                     all_rows.extend(rows)
 
-                    fair_n, fair_r = rows[0], rows[1]
+                    by = {r["method"]: r for r in rows}
                     print(
-                        f"  {deletion_type:8s} {rate:4.0%} seed {seed} | "
-                        f"AEOD fair N/R {fair_n['aeod']:.4f}/{fair_r['aeod']:.4f} "
-                        f"| BCE N/R {rows[2]['aeod']:.4f}/{rows[3]['aeod']:.4f} "
-                        f"| dist fair {fair_n['param_distance']:.2e}"
+                        f"  {deletion_type:8s} {rate:4.0%} seed {seed} | AEOD "
+                        f"FU/RF {by['Fair Unlearning']['aeod']:.3f}/"
+                        f"{by['Retraining (Fair)']['aeod']:.3f} "
+                        f"N/RB {by['Newton (BCE)']['aeod']:.3f}/"
+                        f"{by['Retraining (BCE)']['aeod']:.3f} "
+                        f"SISA {by['SISA (BCE)']['aeod']:.3f} "
+                        f"PRU {by['PRU (BCE)']['aeod']:.3f} | "
+                        f"eps {by['Fair Unlearning']['epsilon']:.2e}"
                     )
 
-        # One raw file per dataset, so datasets can be run separately.
         raw_path = out_dir / RAW_CSV_PATTERN.format(name)
         write_csv(raw_path, all_rows)
         print(f"Raw results: {raw_path}")
@@ -352,8 +363,9 @@ def build_summary(out_dir):
 def write_csv(path, rows):
     if not rows:
         return
+    fieldnames = list(dict.fromkeys(k for row in rows for k in row))
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -363,80 +375,94 @@ def read_csv(path):
         return list(csv.DictReader(f))
 
 
+def _mean_std(values):
+    values = [v for v in values if not math.isnan(v)]
+    if not values:
+        return float("nan"), float("nan")
+    arr = np.array(values)
+    return float(arr.mean()), float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+
+
 def summarize(rows):
     """Mean and std over seeds for each (dataset, deletion, rate, method)."""
     groups = {}
     for row in rows:
-        key = (
-            row["dataset"], row["deletion_type"],
-            float(row["deletion_rate"]), row["method"],
-        )
+        key = (row["dataset"], row["deletion_type"],
+               float(row["deletion_rate"]), row["method"])
         groups.setdefault(key, []).append(row)
 
     summary = []
     for (dataset, deletion_type, rate, method), items in groups.items():
-        out = {
-            "dataset": dataset,
-            "deletion_type": deletion_type,
-            "deletion_rate": rate,
-            "method": method,
-            "num_seeds": len(items),
-        }
-        for metric in ("accuracy", "aeod", "param_distance", "runtime_s"):
-            values = torch.tensor([float(r[metric]) for r in items])
-            out[f"{metric}_mean"] = values.mean().item()
-            out[f"{metric}_std"] = (
-                values.std().item() if len(values) > 1 else 0.0
-            )
+        out = {"dataset": dataset, "deletion_type": deletion_type,
+               "deletion_rate": rate, "method": method,
+               "loss_type": items[0]["loss_type"], "num_seeds": len(items)}
+        for field in SUMMARY_FIELDS:
+            values = [float(r[field]) for r in items if r.get(field, "") != ""]
+            if not values:
+                continue
+            mean, std = _mean_std(values)
+            out[f"{field}_mean"], out[f"{field}_std"] = mean, std
         summary.append(out)
     return summary
 
 
+STYLES = {
+    # Fair loss: solid. BCE loss: dashed. References: dotted.
+    "Full Training (Fair)": dict(color="black", linestyle=":", marker=""),
+    "Fair Unlearning": dict(color="tab:green", linestyle="-", marker="o"),
+    "Retraining (Fair)": dict(color="tab:olive", linestyle="-", marker="x"),
+    "Full Training (BCE)": dict(color="gray", linestyle=":", marker=""),
+    "Newton (BCE)": dict(color="tab:blue", linestyle="--", marker="o"),
+    "SISA (BCE)": dict(color="tab:purple", linestyle="--", marker="s"),
+    "PRU (BCE)": dict(color="tab:red", linestyle="--", marker="^"),
+    "Retraining (BCE)": dict(color="tab:orange", linestyle="--", marker="x"),
+}
+METRIC_LABELS = {
+    "aeod": "Absolute equalized odds difference",
+    "accuracy": "Test accuracy",
+    "dp": "Absolute demographic parity difference",
+    "eopp": "Absolute equality of opportunity difference",
+    "subgroup_acc": "Absolute subgroup accuracy difference",
+}
+
+
 def plot(summary, out_dir):
-    """One AEOD plot and one accuracy plot per (dataset, deletion type)."""
+    """One plot per (dataset, deletion type, metric)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     plot_dir = out_dir / PLOT_SUBDIR
     plot_dir.mkdir(parents=True, exist_ok=True)
-    styles = {
-        "Fair Unlearning": dict(color="tab:green", linestyle="-", marker="o"),
-        "Retraining (Fair)": dict(color="black", linestyle="-", marker="x"),
-        "Newton (BCE)": dict(color="tab:blue", linestyle="--", marker="o"),
-        "Retraining (BCE)": dict(color="tab:gray", linestyle="--", marker="x"),
-    }
 
     combos = sorted({(r["dataset"], r["deletion_type"]) for r in summary})
     for dataset, deletion_type in combos:
-        for metric, label in (("aeod", "AEOD (lower is fairer)"),
-                              ("accuracy", "Test accuracy")):
+        for metric, label in METRIC_LABELS.items():
             fig, ax = plt.subplots(figsize=(5, 3.5))
-            for method, style in styles.items():
+            for method, style in STYLES.items():
+                # Rows from older result files may lack newer metrics.
                 pts = sorted(
-                    (float(r["deletion_rate"]),
-                     float(r[f"{metric}_mean"]),
+                    (float(r["deletion_rate"]), float(r[f"{metric}_mean"]),
                      float(r[f"{metric}_std"]))
                     for r in summary
                     if r["dataset"] == dataset
                     and r["deletion_type"] == deletion_type
                     and r["method"] == method
+                    and r.get(f"{metric}_mean", "") != ""
                 )
                 if not pts:
                     continue
-                xs = [p[0] * 100 for p in pts]
-                ax.errorbar(
-                    xs, [p[1] for p in pts], yerr=[p[2] for p in pts],
-                    label=method, capsize=3, **style,
-                )
+                ax.errorbar([p[0] * 100 for p in pts], [p[1] for p in pts],
+                            yerr=[p[2] for p in pts], label=method,
+                            capsize=3, **style)
             ax.set_title(f"{dataset.upper()}: {deletion_type} deletion")
             ax.set_xlabel("% of training set deleted")
-            ax.set_ylabel(label)
+            ax.set_ylabel(label, fontsize=8)
             ax.grid(alpha=0.3)
-            ax.legend(fontsize=7)
+            ax.legend(fontsize=6)
             fig.tight_layout()
-            out = plot_dir / f"{dataset}_{deletion_type}_{metric}.png"
-            fig.savefig(out, dpi=150)
+            fig.savefig(plot_dir / f"{dataset}_{deletion_type}_{metric}.png",
+                        dpi=150)
             plt.close(fig)
     print(f"Plots: {plot_dir}")
 
@@ -454,13 +480,16 @@ def main():
                         help="Override the paper's per-dataset gamma.")
     parser.add_argument("--lambda-reg", type=float, default=None,
                         help="Override the paper's per-dataset lambda.")
+    parser.add_argument("--sigma", type=float, default=SIGMA,
+                        help="Noise std for b (paper: 1). 0 disables noise.")
     parser.add_argument("--quick", action="store_true",
                         help="1 seed, for a fast smoke test.")
     parser.add_argument("--plot-only", action="store_true",
-                        help="Re-plot from the existing summary CSV.")
+                        help="Re-plot from the existing raw CSVs.")
     parser.add_argument("--vary-split", action="store_true",
-                        help="New train/test split (and new original models) "
-                             "for every seed. The paper keeps one split.")
+                        help="New train/test split (and new noise and "
+                             "original models) for every seed. The paper "
+                             "keeps one split.")
     args = parser.parse_args()
     out_dir = results_dir(args.vary_split)
 
@@ -470,7 +499,7 @@ def main():
 
     seeds = 1 if args.quick else args.seeds
     summary = sweep(args.datasets, seeds, args.gamma, args.lambda_reg,
-                    args.vary_split)
+                    args.vary_split, args.sigma)
     plot(summary, out_dir)
 
 
