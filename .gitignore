@@ -10,5 +10,3 @@ __pycache__/
 # Virtual environments
 venv/
 .venv/
-# HSLS raw datasets (kept locally, not committed)
-data/raw/hsls/*.csv

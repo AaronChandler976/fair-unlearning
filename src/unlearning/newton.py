@@ -14,7 +14,7 @@ def newton_unlearn(
     sensitive_remaining,
     lambda_reg=1e-4,
     gamma=1.0,
-    damping=1e-4,
+    damping=0.0,
 ):
     """
     Approximate the model trained on the remaining dataset
@@ -45,7 +45,8 @@ def newton_unlearn(
         device=hessian.device,
     )
 
-    # Damping helps make the linear system numerically stable.
+    # Optional damping (default 0, as in the paper). The L2 term already
+    # makes the Hessian positive definite, so no damping is needed.
     damped_hessian = hessian + damping * identity
 
     # Solve H * step = gradient instead of computing H inverse.
